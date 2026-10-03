@@ -135,6 +135,40 @@ CREATE TABLE IF NOT EXISTS `vc_line_transfer` (
   KEY `idx_transfer_time` (`transfer_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ---------------- 5b2. 任务号日序列 ----------------
+-- 并发派发时任务号不能用 count()+1（两人同时派发会撞 uk_task_no，导致一笔半派发回滚）。
+-- 以日期为键的原子序列：INSERT ... ON DUPLICATE KEY UPDATE seq=LAST_INSERT_ID(seq+1)，
+-- 行锁串行化取号，每个事务拿到不同序号，配合检测链任务号一经生成不再改变。
+CREATE TABLE IF NOT EXISTS `vc_task_no_seq` (
+  `check_date` DATE NOT NULL,
+  `seq`        INT  NOT NULL DEFAULT 0,
+  PRIMARY KEY (`check_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------- 5c. 排班小时格占用 ----------------
+-- 只记录「未结束」任务（CHECKING/RETEST）对（引车员 × 日期 × 小时格）的占用：
+--   ① uk_slot_active 生成列唯一索引：同一引车员同日同小时最多一个未结束任务（已合格/不合格的任务 key 为 NULL，不占名额）；
+--   ② uk_task_active：同一任务在任何时刻只能占一个小时格，改派时旧格先释放、新格只允许一次成功；
+-- 任务、小时格、车辆队列（起点工位占位）在派发事务内一并提交，任何一步失败整笔回滚，不留半派发记录。
+CREATE TABLE IF NOT EXISTS `vc_schedule_slot` (
+  `id`            BIGINT       NOT NULL AUTO_INCREMENT,
+  `task_id`       BIGINT       NOT NULL COMMENT '占用该格的检测任务',
+  `driver_id`     BIGINT       NOT NULL COMMENT '引车员',
+  `check_date`    DATE         NOT NULL COMMENT '排班日期',
+  `schedule_hour` INT          NOT NULL COMMENT '排班小时段 8..17',
+  `active`        TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否未结束占用：1在检/复检占用，0已结束（仅留痕）',
+  `active_task_key` VARCHAR(40) GENERATED ALWAYS AS (CASE WHEN `active` = 1 THEN CONCAT(`task_id`) ELSE NULL END) VIRTUAL,
+  `active_slot_key` VARCHAR(64) GENERATED ALWAYS AS
+      (CASE WHEN `active` = 1 THEN CONCAT(`driver_id`, '-', `check_date`, '-', `schedule_hour`) ELSE NULL END) VIRTUAL,
+  `create_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次占格时间',
+  `update_time`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最近改派时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_task_active` (`active_task_key`),
+  UNIQUE KEY `uk_slot_active` (`active_slot_key`),
+  KEY `idx_slot_driver_date` (`driver_id`, `check_date`),
+  KEY `idx_slot_task` (`task_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ---------------- 6. 检测报告 ----------------
 CREATE TABLE IF NOT EXISTS `vc_report` (
   `id`             BIGINT       NOT NULL AUTO_INCREMENT,
@@ -343,3 +377,17 @@ INSERT INTO `vc_driver` (`id`,`driver_name`,`cert_level`,`cert_no`,`shift_hours`
  (4,'赵引车','B2','YCY-2021-0719','8,9,10,14,15',5,'ON_DUTY'),
  (5,'孙引车','A2','YCY-2017-0923','15,16,17',4,'ON_DUTY'),
  (6,'周引车','C1','YCY-2022-0456','8,9,10,11',0,'OFF_DUTY');
+
+-- 排班小时格占用：未结束任务（在检 1-5、11 与复检 10）active=1 占格；已合格/不合格任务 6-9 active=0 仅留痕
+INSERT INTO `vc_schedule_slot` (`task_id`,`driver_id`,`check_date`,`schedule_hour`,`active`) VALUES
+ (1,1,'2026-09-27',9,1),
+ (2,1,'2026-09-27',8,1),
+ (3,2,'2026-09-27',10,1),
+ (4,2,'2026-09-27',11,1),
+ (5,3,'2026-09-27',13,1),
+ (6,4,'2026-09-27',9,0),
+ (7,4,'2026-09-27',14,0),
+ (8,5,'2026-09-27',15,0),
+ (9,5,'2026-09-27',16,0),
+ (10,5,'2026-09-27',17,1),
+ (11,2,'2026-09-28',10,1);

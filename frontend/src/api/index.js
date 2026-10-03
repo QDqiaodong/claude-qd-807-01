@@ -2,11 +2,16 @@ import axios from 'axios'
 
 const http = axios.create({ baseURL: '/api', timeout: 15000 })
 
+// 排班工作流的并发冲突（409）：响应体仍带任务当前归属 data，错误对象上挂一份，页面按它刷格子
 http.interceptors.response.use(
   (res) => res.data,
   (err) => {
-    const msg = err?.response?.data?.message || err.message || '请求失败'
-    return Promise.reject(new Error(msg))
+    const body = err?.response?.data
+    const msg = body?.message || err.message || '请求失败'
+    const error = new Error(msg)
+    error.status = err?.response?.status
+    error.data = body?.data || null
+    return Promise.reject(error)
   }
 )
 
@@ -51,6 +56,16 @@ export const fetchCalStat = () => unwrap(http.get('/devices/cal-stat'))
 export const fetchDrivers = () => unwrap(http.get('/drivers'))
 export const fetchSchedule = (date) => unwrap(http.get('/drivers/schedule', { params: { date } }))
 
+// ---------------- 排班派发工作流 ----------------
+export const checkDispatch = (payload) =>
+  unwrap(http.post('/dispatch/check', payload))
+export const checkReassign = (taskId, driverId, hour) =>
+  unwrap(http.get(`/tasks/${taskId}/reassign/check`, { params: { driverId, hour } }))
+export const dispatchTask = (payload) =>
+  unwrap(http.post('/dispatch', payload))
+export const reassignTaskV2 = (taskId, payload) =>
+  unwrap(http.post(`/tasks/${taskId}/reassign`, payload))
+
 // ---------------- 在检车辆跨线恢复处置台 ----------------
 export const fetchRecoveryBoard = () => unwrap(http.get('/recovery/board'))
 export const fetchAffectedTask = (taskId) => unwrap(http.get(`/recovery/tasks/${taskId}`))
@@ -58,10 +73,6 @@ export const confirmTransfer = (taskId, payload) =>
   unwrap(http.post(`/recovery/tasks/${taskId}/transfer`, payload))
 export const keepPending = (taskId, payload) =>
   unwrap(http.post(`/recovery/tasks/${taskId}/keep-pending`, payload))
-export const assignTask = (driverId, payload) =>
-  unwrap(http.post(`/drivers/${driverId}/assign`, payload))
-export const reassignTask = (taskId, driverId, hour) =>
-  unwrap(http.post(`/drivers/tasks/${taskId}/reassign`, null, { params: { driverId, hour } }))
 export const fetchDriverStats = (date) =>
   unwrap(http.get('/drivers/stats', { params: { date } }))
 

@@ -15,9 +15,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.vehicle.check.common.BizException;
+import com.vehicle.check.common.ScheduleConflictException;
 import com.vehicle.check.common.StationDict;
 import com.vehicle.check.domain.Driver;
 import com.vehicle.check.domain.Line;
+import com.vehicle.check.domain.ScheduleSlot;
 import com.vehicle.check.domain.Station;
 import com.vehicle.check.domain.Task;
 import com.vehicle.check.domain.TaskStationRecord;
@@ -31,6 +33,7 @@ import com.vehicle.check.dto.TaskCreateRequest;
 import com.vehicle.check.dto.TaskVO;
 import com.vehicle.check.repository.DriverRepository;
 import com.vehicle.check.repository.LineRepository;
+import com.vehicle.check.repository.ScheduleSlotRepository;
 import com.vehicle.check.repository.StationRepository;
 import com.vehicle.check.repository.TaskRepository;
 import com.vehicle.check.repository.TaskStationRecordRepository;
@@ -50,11 +53,14 @@ public class TaskFlowService {
     private final LineRepository lineRepository;
     private final StationRepository stationRepository;
     private final DriverRepository driverRepository;
+    private final ScheduleSlotRepository slotRepository;
+    private final TaskNoGenerator taskNoGenerator;
     private final StringRedisTemplate redisTemplate;
 
     public TaskFlowService(TaskRepository taskRepository, TaskStationRecordRepository recordRepository,
                            VehicleRepository vehicleRepository, LineRepository lineRepository,
                            StationRepository stationRepository, DriverRepository driverRepository,
+                           ScheduleSlotRepository slotRepository, TaskNoGenerator taskNoGenerator,
                            StringRedisTemplate redisTemplate) {
         this.taskRepository = taskRepository;
         this.recordRepository = recordRepository;
@@ -62,6 +68,8 @@ public class TaskFlowService {
         this.lineRepository = lineRepository;
         this.stationRepository = stationRepository;
         this.driverRepository = driverRepository;
+        this.slotRepository = slotRepository;
+        this.taskNoGenerator = taskNoGenerator;
         this.redisTemplate = redisTemplate;
     }
 
@@ -113,9 +121,24 @@ public class TaskFlowService {
             throw new BizException("检测线「" + line.getLineNo() + "」尚未配置工位，不能派发检测任务");
         }
         Station first = stations.get(0);
+        if (!"IDLE".equals(first.getStatus())) {
+            throw new BizException("检测线「" + line.getLineNo() + "」起点工位（" + first.getStationName()
+                    + "）当前为" + StationDict.stationStatusName(first.getStatus()) + "，暂无空位接入车辆");
+        }
+
+        Driver driver = null;
+        if (request.getDriverId() != null) {
+            driver = driverRepository.findById(request.getDriverId())
+                    .orElseThrow(() -> new BizException("引车员不存在：id=" + request.getDriverId()));
+            checkDriverOnDuty(driver);
+            checkHour(request.getScheduleHour());
+            checkDriverShift(driver, request.getScheduleHour());
+        } else {
+            checkHourNullable(request.getScheduleHour());
+        }
 
         Task task = new Task();
-        task.setTaskNo(nextTaskNo(checkDate));
+        task.setTaskNo(taskNoGenerator.nextTaskNo(checkDate));
         task.setVehicleId(vehicle.getId());
         task.setLineId(line.getId());
         task.setCurrentStationId(first.getId());
@@ -127,20 +150,31 @@ public class TaskFlowService {
         task.setRetestTimes(0);
         task.setCreateTime(LocalDateTime.now());
 
-        if (request.getDriverId() != null) {
-            Driver driver = driverRepository.findById(request.getDriverId())
-                    .orElseThrow(() -> new BizException("引车员不存在：id=" + request.getDriverId()));
-            if (request.getScheduleHour() != null) {
-                checkDriverShift(driver, request.getScheduleHour());
+        // 任务、小时格、车辆队列（起点工位）同一事务绑定：原子占位起点，并发下最多一笔成功
+        int claimed = stationRepository.claimStation(first.getId());
+        if (claimed == 0) {
+            throw new BizException("检测线「" + line.getLineNo() + "」起点工位（" + first.getStationName()
+                    + "）在确认瞬间已被占用或停用，本次派发未生效，请刷新后重试");
+        }
+        Task saved = taskRepository.save(task);
+        if (driver != null && request.getScheduleHour() != null) {
+            ScheduleSlot slot = new ScheduleSlot();
+            slot.setTaskId(saved.getId());
+            slot.setDriverId(driver.getId());
+            slot.setCheckDate(checkDate);
+            slot.setScheduleHour(request.getScheduleHour());
+            slot.setActive(true);
+            try {
+                slotRepository.save(slot);
+                slotRepository.flush();
+            } catch (org.springframework.dao.DataIntegrityViolationException e) {
+                // 整笔事务回滚（任务与起点占位都不落库），不带任务归属
+                throw new ScheduleConflictException("引车员「" + driver.getDriverName() + "」"
+                        + request.getScheduleHour() + ":00 时段刚被另一笔派发占用（同一引车员同日同小时"
+                        + "只能有一个未结束任务），本次派发未生效，请刷新格子后重选", null);
             }
         }
-        if (request.getScheduleHour() != null) {
-            checkHour(request.getScheduleHour());
-        }
-
-        first.setStatus("OCCUPIED");
-        stationRepository.save(first);
-        return toVO(taskRepository.save(task), vehicle.getPlateNo());
+        return toVO(saved, vehicle.getPlateNo());
     }
 
     /**
@@ -228,6 +262,8 @@ public class TaskFlowService {
             task.setStatus("PASS".equals(result) ? "PASS" : "FAIL");
             station.setStatus("IDLE");
             stationRepository.save(station);
+            // 任务结束：小时格立即释放（active=0），该引车员同一小时段可再接下一辆车
+            slotRepository.releaseByTask(task.getId());
             if (task.getDriverId() != null) {
                 driverRepository.findById(task.getDriverId()).ifPresent(driver -> {
                     driver.setCheckedCount(driver.getCheckedCount() + 1);
@@ -340,15 +376,25 @@ public class TaskFlowService {
                 .map(Station::getStationType).orElse("LOGIN");
     }
 
-    private String nextTaskNo(LocalDate date) {
-        long count = taskRepository.count() + 1;
-        return String.format("TASK-%s-%03d", date.toString().replace("-", ""), count);
-    }
-
+    /** 排班小时段必须在 8:00 - 18:00 之间 */
     private void checkHour(Integer hour) {
         if (hour == null || hour < StationDict.SHIFT_START_HOUR || hour >= StationDict.SHIFT_END_HOUR) {
             throw new BizException("排班小时段必须在 " + StationDict.SHIFT_START_HOUR + ":00 - "
                     + StationDict.SHIFT_END_HOUR + ":00 之间");
+        }
+    }
+
+    /** 未指定引车员时小时段也必须合法（允许为空） */
+    private void checkHourNullable(Integer hour) {
+        if (hour != null && (hour < StationDict.SHIFT_START_HOUR || hour >= StationDict.SHIFT_END_HOUR)) {
+            throw new BizException("排班小时段必须在 " + StationDict.SHIFT_START_HOUR + ":00 - "
+                    + StationDict.SHIFT_END_HOUR + ":00 之间");
+        }
+    }
+
+    private void checkDriverOnDuty(Driver driver) {
+        if (!"ON_DUTY".equals(driver.getStatus())) {
+            throw new BizException("引车员「" + driver.getDriverName() + "」当日不在岗，不能派单");
         }
     }
 
@@ -421,6 +467,12 @@ public class TaskFlowService {
             records.add(rvo);
         }
         vo.setRecords(records);
+        // 是否已开始检测以工位记录为准（登录是第一道检测动作）；只有未开始且未结束才可改派，
+        // 且改派绝不改变检测结果、当前工位与任务号
+        boolean started = !records.isEmpty();
+        boolean finished = "PASS".equals(task.getStatus()) || "FAIL".equals(task.getStatus());
+        vo.setStarted(started);
+        vo.setReassignAllowed(!started && !finished);
         return vo;
     }
 

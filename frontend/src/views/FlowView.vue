@@ -428,7 +428,14 @@ async function submitTask () {
     ElMessage.success('任务已派发至流水线起点')
     await loadAll()
   } catch (e) {
-    ElMessage.error(e.message)
+    if (e.status === 409) {
+      // 派发格冲突：本次整笔回滚未落库，关闭弹窗并按最新格子刷新
+      taskVisible.value = false
+      ElMessage.warning(e.message)
+      await loadAll()
+    } else {
+      ElMessage.error(e.message)
+    }
   }
 }
 

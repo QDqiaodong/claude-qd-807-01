@@ -3,6 +3,9 @@ package com.vehicle.check.controller;
 import java.time.LocalDate;
 import java.util.List;
 
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -12,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.vehicle.check.common.ApiResponse;
+import com.vehicle.check.common.ScheduleConflictException;
 import com.vehicle.check.dto.IssueReportRequest;
 import com.vehicle.check.dto.LineReportStatDTO;
 import com.vehicle.check.dto.ReportVO;
@@ -71,5 +75,11 @@ public class ReportController {
     public ApiResponse<List<ReportVO>> failToday(@RequestParam(required = false) String date) {
         LocalDate day = date == null || date.isBlank() ? LocalDate.now() : LocalDate.parse(date);
         return ApiResponse.success(reportService.failReportsOfDate(day));
+    }
+
+    /** 复检派发并发冲突：本次未生效（整笔已回滚），前端按提示刷新格子 */
+    @ExceptionHandler(ScheduleConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleScheduleConflict(ScheduleConflictException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(e.getMessage()));
     }
 }

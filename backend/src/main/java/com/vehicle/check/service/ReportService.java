@@ -12,11 +12,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.vehicle.check.common.BizException;
+import com.vehicle.check.common.ScheduleConflictException;
 import com.vehicle.check.common.StationDict;
 import com.vehicle.check.domain.Device;
 import com.vehicle.check.domain.Driver;
 import com.vehicle.check.domain.Line;
 import com.vehicle.check.domain.Report;
+import com.vehicle.check.domain.ScheduleSlot;
 import com.vehicle.check.domain.Station;
 import com.vehicle.check.domain.Task;
 import com.vehicle.check.domain.TaskStationRecord;
@@ -31,6 +33,7 @@ import com.vehicle.check.repository.DeviceRepository;
 import com.vehicle.check.repository.DriverRepository;
 import com.vehicle.check.repository.LineRepository;
 import com.vehicle.check.repository.ReportRepository;
+import com.vehicle.check.repository.ScheduleSlotRepository;
 import com.vehicle.check.repository.StationRepository;
 import com.vehicle.check.repository.TaskRepository;
 import com.vehicle.check.repository.TaskStationRecordRepository;
@@ -53,11 +56,13 @@ public class ReportService {
     private final StationRepository stationRepository;
     private final DeviceRepository deviceRepository;
     private final DriverRepository driverRepository;
+    private final ScheduleSlotRepository slotRepository;
 
     public ReportService(ReportRepository reportRepository, TaskRepository taskRepository,
                          TaskStationRecordRepository recordRepository, VehicleRepository vehicleRepository,
                          LineRepository lineRepository, StationRepository stationRepository,
-                         DeviceRepository deviceRepository, DriverRepository driverRepository) {
+                         DeviceRepository deviceRepository, DriverRepository driverRepository,
+                         ScheduleSlotRepository slotRepository) {
         this.reportRepository = reportRepository;
         this.taskRepository = taskRepository;
         this.recordRepository = recordRepository;
@@ -66,6 +71,7 @@ public class ReportService {
         this.stationRepository = stationRepository;
         this.deviceRepository = deviceRepository;
         this.driverRepository = driverRepository;
+        this.slotRepository = slotRepository;
     }
 
     public List<ReportVO> listReports() {
@@ -167,9 +173,35 @@ public class ReportService {
         }
         List<Station> stations = stationRepository.findByLineIdOrderBySeqNoAsc(line.getId());
         Station first = stations.get(0);
+        if (!"IDLE".equals(first.getStatus())) {
+            throw new BizException("检测线「" + line.getLineNo() + "」起点工位（" + first.getStationName()
+                    + "）当前为" + StationDict.stationStatusName(first.getStatus()) + "，复检车辆暂无法进入");
+        }
+
+        LocalDate checkDate = request.getCheckDate() == null ? LocalDate.now() : request.getCheckDate();
+        Long driverId = request.getDriverId() == null ? origin.getDriverId() : request.getDriverId();
+        Integer scheduleHour = request.getScheduleHour() == null
+                ? origin.getScheduleHour() : request.getScheduleHour();
+        Driver driver = null;
+        if (driverId != null) {
+            driver = driverRepository.findById(driverId)
+                    .orElseThrow(() -> new BizException("引车员不存在：id=" + driverId));
+            if (!"ON_DUTY".equals(driver.getStatus())) {
+                throw new BizException("引车员「" + driver.getDriverName() + "」当日不在岗，不能安排复检派单");
+            }
+            if (scheduleHour == null || scheduleHour < StationDict.SHIFT_START_HOUR
+                    || scheduleHour >= StationDict.SHIFT_END_HOUR) {
+                throw new BizException("排班小时段必须在 " + StationDict.SHIFT_START_HOUR + ":00 - "
+                        + StationDict.SHIFT_END_HOUR + ":00 之间");
+            }
+            if (!DispatchService.isShiftHour(driver, scheduleHour)) {
+                throw new BizException("引车员「" + driver.getDriverName() + "」当日排班小时段为 "
+                        + TaskFlowService.formatShift(driver.getShiftHours())
+                        + "，不包含 " + scheduleHour + ":00 时段");
+            }
+        }
 
         Task task = new Task();
-        LocalDate checkDate = request.getCheckDate() == null ? LocalDate.now() : request.getCheckDate();
         task.setTaskNo(String.format("TASK-%s-R%03d", checkDate.toString().replace("-", ""),
                 origin.getRetestTimes() + 1));
         task.setVehicleId(origin.getVehicleId());
@@ -177,8 +209,8 @@ public class ReportService {
         task.setCurrentStationId(first.getId());
         task.setCurrentSeqNo(first.getSeqNo());
         task.setStatus("RETEST");
-        task.setDriverId(request.getDriverId() == null ? origin.getDriverId() : request.getDriverId());
-        task.setScheduleHour(request.getScheduleHour() == null ? origin.getScheduleHour() : request.getScheduleHour());
+        task.setDriverId(driverId);
+        task.setScheduleHour(scheduleHour);
         task.setCheckDate(checkDate);
         task.setRetestTimes(origin.getRetestTimes() + 1);
         // 复检链必须咬住原报告：转线只换检测线，不换任务/不换报告关联，
@@ -187,14 +219,35 @@ public class ReportService {
                 ? report.getReportNo() : report.getRetestOf();
         task.setOriginReportNo(originReportNo);
         task.setCreateTime(LocalDateTime.now());
-        first.setStatus("OCCUPIED");
-        stationRepository.save(first);
 
+        // 复检同样是「任务 + 小时格 + 起点工位」一次绑定，任何一环冲突整笔回滚
+        int claimed = stationRepository.claimStation(first.getId());
+        if (claimed == 0) {
+            throw new BizException("检测线「" + line.getLineNo() + "」起点工位（" + first.getStationName()
+                    + "）在确认瞬间已被占用，复检未生效，请刷新后重试");
+        }
         report.setRetestOf(report.getRetestOf() == null || report.getRetestOf().isBlank()
                 ? report.getReportNo() : report.getRetestOf());
         reportRepository.save(report);
 
         Task saved = taskRepository.save(task);
+        if (driver != null && scheduleHour != null) {
+            ScheduleSlot slot = new ScheduleSlot();
+            slot.setTaskId(saved.getId());
+            slot.setDriverId(driver.getId());
+            slot.setCheckDate(checkDate);
+            slot.setScheduleHour(scheduleHour);
+            slot.setActive(true);
+            try {
+                slotRepository.save(slot);
+                slotRepository.flush();
+            } catch (org.springframework.dao.DataIntegrityViolationException e) {
+                // 整笔事务回滚（复检任务与起点占位都不落库），不带任务归属
+                throw new ScheduleConflictException("引车员「" + driver.getDriverName() + "」"
+                        + scheduleHour + ":00 时段已有未结束任务，复检派单未生效，请改派到其他时段",
+                        null);
+            }
+        }
         return taskFlowView(saved);
     }
 
@@ -308,6 +361,10 @@ public class ReportService {
         vo.setCheckDate(task.getCheckDate());
         vo.setRetestTimes(task.getRetestTimes());
         vo.setOriginReportNo(task.getOriginReportNo());
+        boolean started = !recordRepository.findByTaskIdOrderBySeqNoAsc(task.getId()).isEmpty();
+        boolean finished = "PASS".equals(task.getStatus()) || "FAIL".equals(task.getStatus());
+        vo.setStarted(started);
+        vo.setReassignAllowed(!started && !finished);
         return vo;
     }
 }

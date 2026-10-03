@@ -2,6 +2,9 @@ package com.vehicle.check.controller;
 
 import java.util.List;
 
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -11,6 +14,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.vehicle.check.common.ApiResponse;
+import com.vehicle.check.common.ScheduleConflictException;
 import com.vehicle.check.dto.FailItemDTO;
 import com.vehicle.check.dto.OverviewVO;
 import com.vehicle.check.dto.StationResultRequest;
@@ -98,5 +102,11 @@ public class TaskController {
                 reportRepository.count(),
                 reportRepository.count() - reportRepository.findByConclusionOrderBySignDateDesc("PASS").size(),
                 resourceService.calStat().getOverdueCount()));
+    }
+
+    /** 派发并发冲突：本次未生效（整笔已回滚），前端按提示刷新格子 */
+    @ExceptionHandler(ScheduleConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleScheduleConflict(ScheduleConflictException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(e.getMessage()));
     }
 }

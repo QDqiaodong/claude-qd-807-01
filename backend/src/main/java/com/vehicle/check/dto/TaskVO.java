@@ -41,6 +41,13 @@ public class TaskVO {
     private Integer retestTimes;
     /** 复检任务关联的原报告编号（跨线恢复后仍保留） */
     private String originReportNo;
+
+    /** 是否已开始检测（已产生任一工位记录）；未开始才允许改派 */
+    private Boolean started;
+
+    /** 当前是否可改派：未开始检测且任务未结束 */
+    private Boolean reassignAllowed;
+
     private LocalDateTime createTime;
     private LocalDateTime finishTime;
     private List<RecordVO> records = new ArrayList<>();

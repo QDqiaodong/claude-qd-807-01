@@ -15,20 +15,22 @@ import com.vehicle.check.common.BizException;
 import com.vehicle.check.common.StationDict;
 import com.vehicle.check.domain.Device;
 import com.vehicle.check.domain.Driver;
+import com.vehicle.check.domain.ScheduleSlot;
 import com.vehicle.check.domain.Station;
 import com.vehicle.check.domain.Task;
 import com.vehicle.check.domain.Vehicle;
-import com.vehicle.check.dto.AssignRequest;
 import com.vehicle.check.dto.CalibrateRequest;
 import com.vehicle.check.dto.CalibrateStatDTO;
 import com.vehicle.check.dto.DeviceVO;
-import com.vehicle.check.dto.DriverStatDTO;
 import com.vehicle.check.dto.ScheduleCellVO;
 import com.vehicle.check.dto.ScheduleRowVO;
 import com.vehicle.check.repository.DeviceRepository;
 import com.vehicle.check.repository.DriverRepository;
+import com.vehicle.check.repository.LineRepository;
+import com.vehicle.check.repository.ScheduleSlotRepository;
 import com.vehicle.check.repository.StationRepository;
 import com.vehicle.check.repository.TaskRepository;
+import com.vehicle.check.repository.TaskStationRecordRepository;
 import com.vehicle.check.repository.VehicleRepository;
 
 /**
@@ -42,15 +44,22 @@ public class ResourceService {
     private final TaskRepository taskRepository;
     private final VehicleRepository vehicleRepository;
     private final StationRepository stationRepository;
+    private final ScheduleSlotRepository slotRepository;
+    private final TaskStationRecordRepository recordRepository;
+    private final LineRepository lineRepository;
 
     public ResourceService(DeviceRepository deviceRepository, DriverRepository driverRepository,
                            TaskRepository taskRepository, VehicleRepository vehicleRepository,
-                           StationRepository stationRepository) {
+                           StationRepository stationRepository, ScheduleSlotRepository slotRepository,
+                           TaskStationRecordRepository recordRepository, LineRepository lineRepository) {
         this.deviceRepository = deviceRepository;
         this.driverRepository = driverRepository;
         this.taskRepository = taskRepository;
         this.vehicleRepository = vehicleRepository;
         this.stationRepository = stationRepository;
+        this.slotRepository = slotRepository;
+        this.recordRepository = recordRepository;
+        this.lineRepository = lineRepository;
     }
 
     // ---------------- 设备标定 ----------------
@@ -111,7 +120,9 @@ public class ResourceService {
     // ---------------- 引车员排班 ----------------
 
     /**
-     * 排班格子表：纵轴引车员、横轴小时段（8:00-18:00），格子里塞检测任务车牌小块
+     * 排班格子表（服务端状态恢复）：纵轴引车员、横轴小时段（8:00-18:00）。
+     * 每个格子带状态：可派空格 / 待开始（可改派）/ 在检 / 复检 / 合格 / 不合格 / 不在班 / 不在岗，
+     * 并带点格时的阻断原因；格子内容只来自有效小时格 vc_schedule_slot（active=1）与任务落库状态。
      */
     public List<ScheduleRowVO> schedule(LocalDate date) {
         LocalDate day = date == null ? LocalDate.now() : date;
@@ -119,10 +130,25 @@ public class ResourceService {
                 .collect(Collectors.toMap(Vehicle::getId, Vehicle::getPlateNo, (a, b) -> a));
         Map<Long, String> stationMap = stationRepository.findAll().stream()
                 .collect(Collectors.toMap(Station::getId, Station::getStationName, (a, b) -> a));
-
-        List<Task> dayTasks = taskRepository.findAll().stream()
+        Map<Long, String> lineMap = lineRepository.findAll().stream()
+                .collect(Collectors.toMap(com.vehicle.check.domain.Line::getId,
+                        com.vehicle.check.domain.Line::getLineNo, (a, b) -> a));
+        Map<Long, Task> taskMap = taskRepository.findAll().stream()
                 .filter(task -> day.equals(task.getCheckDate()))
-                .toList();
+                .collect(Collectors.toMap(Task::getId, t -> t, (a, b) -> a));
+        // 格子归属只认真实占格记录：已结束的任务 active=0 已释放，历史格在按 task 补展示时单独取
+        Map<String, ScheduleSlot> activeSlotByDriverHour = slotRepository.findByCheckDateAndActiveTrue(day).stream()
+                .collect(Collectors.toMap(s -> s.getDriverId() + "-" + s.getScheduleHour(),
+                        s -> s, (a, b) -> a));
+        // 已释放（任务合格/不合格或改走）的当日格子仅作历史痕迹；同一格若又被新任务占走，
+        // active 槽位优先（上面已取），这里只在没有活动占格时展示最近一次痕迹
+        Map<String, ScheduleSlot> finishedSlotByDriverHour = slotRepository.findAll().stream()
+                .filter(s -> day.equals(s.getCheckDate()) && Boolean.FALSE.equals(s.getActive()))
+                .collect(Collectors.toMap(s -> s.getDriverId() + "-" + s.getScheduleHour(),
+                        s -> s, (a, b) -> a.getId() >= b.getId() ? a : b));
+        Map<Long, Long> taskStationCount = taskMap.keySet().stream()
+                .collect(Collectors.toMap(id -> id,
+                        id -> (long) recordRepository.findByTaskIdOrderBySeqNoAsc(id).size()));
 
         List<ScheduleRowVO> rows = new ArrayList<>();
         for (Driver driver : driverRepository.findAllByOrderByIdAsc()) {
@@ -136,24 +162,49 @@ public class ResourceService {
             row.setStatus(driver.getStatus());
 
             List<ScheduleCellVO> cells = new ArrayList<>();
+            boolean onDuty = "ON_DUTY".equals(driver.getStatus());
             for (int hour = StationDict.SHIFT_START_HOUR; hour < StationDict.SHIFT_END_HOUR; hour++) {
-                final int slot = hour;
+                String key = driver.getId() + "-" + hour;
                 ScheduleCellVO cell = new ScheduleCellVO();
                 cell.setHour(hour);
                 cell.setHourLabel(hour + ":00");
-                List<Task> hit = dayTasks.stream()
-                        .filter(task -> driver.getId().equals(task.getDriverId()))
-                        .filter(task -> task.getScheduleHour() != null && task.getScheduleHour() == slot)
-                        .toList();
-                if (!hit.isEmpty()) {
-                    Task task = hit.get(0);
-                    cell.setTaskId(task.getId());
-                    cell.setTaskNo(task.getTaskNo());
-                    cell.setPlateNo(plateMap.getOrDefault(task.getVehicleId(), ""));
-                    cell.setStatus(task.getStatus());
-                    cell.setStatusName(StationDict.taskStatusName(task.getStatus()));
-                    cell.setStationName(task.getCurrentStationId() == null ? ""
-                            : stationMap.getOrDefault(task.getCurrentStationId(), ""));
+                boolean inShift = DispatchService.isShiftHour(driver, hour);
+                cell.setInShift(inShift);
+                cell.setOnDuty(onDuty);
+
+                ScheduleSlot slot = activeSlotByDriverHour.get(key);
+                if (slot == null) {
+                    slot = finishedSlotByDriverHour.get(key);
+                }
+                if (slot != null) {
+                    Task task = taskMap.get(slot.getTaskId());
+                    // 已被改派释放的旧格（active=0 且任务仍未结束）不渲染——任务已不在该格，
+                    // 只渲染当前有效占格，以及已合格/不合格任务留在格内的结果痕迹
+                    boolean releasedAway = Boolean.FALSE.equals(slot.getActive()) && task != null
+                            && !"PASS".equals(task.getStatus()) && !"FAIL".equals(task.getStatus());
+                    if (task != null && !releasedAway) {
+                        fillTaskCell(cell, task, plateMap, stationMap,
+                                lineMap.getOrDefault(task.getLineId(), ""),
+                                taskStationCount.getOrDefault(task.getId(), 0L) > 0);
+                    } else if (releasedAway) {
+                        cell.setCellState(inShift ? (onDuty ? "EMPTY_SHIFT" : "OFF_DUTY") : "OFF_SHIFT");
+                        if (!onDuty) {
+                            cell.getBlockReasons().add("引车员「" + driver.getDriverName() + "」当日不在岗，不能派单");
+                        }
+                        if (!inShift) {
+                            cell.getBlockReasons().add(hour + ":00 不在该引车员当日排班小时段 "
+                                    + TaskFlowService.formatShift(driver.getShiftHours()) + " 内");
+                        }
+                    }
+                } else {
+                    cell.setCellState(inShift ? (onDuty ? "EMPTY_SHIFT" : "OFF_DUTY") : "OFF_SHIFT");
+                    if (!onDuty) {
+                        cell.getBlockReasons().add("引车员「" + driver.getDriverName() + "」当日不在岗，不能派单");
+                    }
+                    if (!inShift) {
+                        cell.getBlockReasons().add(hour + ":00 不在该引车员当日排班小时段 "
+                                + TaskFlowService.formatShift(driver.getShiftHours()) + " 内");
+                    }
                 }
                 cells.add(cell);
             }
@@ -163,71 +214,36 @@ public class ResourceService {
         return rows;
     }
 
-    /**
-     * 派单：把某个检测任务挂到引车员的某个小时段
-     */
-    @Transactional
-    public ScheduleCellVO assign(Long driverId, AssignRequest request) {
-        Driver driver = driverRepository.findById(driverId)
-                .orElseThrow(() -> new BizException("引车员不存在：id=" + driverId));
-        if (!"ON_DUTY".equals(driver.getStatus())) {
-            throw new BizException("引车员「" + driver.getDriverName() + "」当日不在岗，不能派单");
-        }
-        Task task = taskRepository.findById(request.getTaskId())
-                .orElseThrow(() -> new BizException("检测任务不存在：id=" + request.getTaskId()));
-        checkHour(request.getScheduleHour());
-        Set<String> hours = Set.of(driver.getShiftHours().split(","));
-        if (!hours.contains(String.valueOf(request.getScheduleHour()))) {
-            throw new BizException("引车员「" + driver.getDriverName() + "」当日排班小时段为 "
-                    + TaskFlowService.formatShift(driver.getShiftHours())
-                    + "，不包含 " + request.getScheduleHour() + ":00 时段");
-        }
-        long occupied = taskRepository.findAll().stream()
-                .filter(t -> day(t).equals(day(task)))
-                .filter(t -> driverId.equals(t.getDriverId()))
-                .filter(t -> t.getScheduleHour() != null && t.getScheduleHour().equals(request.getScheduleHour()))
-                .filter(t -> !t.getId().equals(task.getId()))
-                .count();
-        if (occupied > 0) {
-            throw new BizException("引车员「" + driver.getDriverName() + "」在 " + request.getScheduleHour()
-                    + ":00 时段已有在检任务，不能重复派单");
-        }
-        task.setDriverId(driverId);
-        task.setScheduleHour(request.getScheduleHour());
-        taskRepository.save(task);
-
-        ScheduleCellVO cell = new ScheduleCellVO();
-        cell.setHour(request.getScheduleHour());
-        cell.setHourLabel(request.getScheduleHour() + ":00");
+    private void fillTaskCell(ScheduleCellVO cell, Task task, Map<Long, String> plateMap,
+                              Map<Long, String> stationMap, String lineNo, boolean started) {
         cell.setTaskId(task.getId());
         cell.setTaskNo(task.getTaskNo());
-        cell.setPlateNo(vehicleRepository.findById(task.getVehicleId()).map(Vehicle::getPlateNo).orElse(""));
+        cell.setPlateNo(plateMap.getOrDefault(task.getVehicleId(), ""));
+        cell.setLineId(task.getLineId());
+        cell.setLineNo(lineNo);
         cell.setStatus(task.getStatus());
         cell.setStatusName(StationDict.taskStatusName(task.getStatus()));
-        return cell;
-    }
-
-    /**
-     * 改派：把已有格子上的任务换到另一名引车员的某个小时段
-     */
-    @Transactional
-    public ScheduleCellVO reassign(Long taskId, Long driverId, Integer hour) {
-        Task task = taskRepository.findById(taskId)
-                .orElseThrow(() -> new BizException("检测任务不存在：id=" + taskId));
-        AssignRequest request = new AssignRequest();
-        request.setTaskId(taskId);
-        request.setScheduleHour(hour == null ? task.getScheduleHour() : hour);
-        return assign(driverId, request);
-    }
-
-    public List<DriverStatDTO> driverStats(LocalDate date) {
-        LocalDate day = date == null ? LocalDate.now() : date;
-        Map<Long, String> nameMap = driverRepository.findAll().stream()
-                .collect(Collectors.toMap(Driver::getId, Driver::getDriverName, (a, b) -> a));
-        return taskRepository.countGroupByDriverAndDate(day).stream()
-                .peek(dto -> dto.setDriverName(nameMap.getOrDefault(dto.getDriverId(), "未派单")))
-                .sorted((a, b) -> Long.compare(b.getTaskCount(), a.getTaskCount()))
-                .toList();
+        cell.setStationName(task.getCurrentStationId() == null ? ""
+                : stationMap.getOrDefault(task.getCurrentStationId(), ""));
+        boolean finished = "PASS".equals(task.getStatus()) || "FAIL".equals(task.getStatus());
+        if (finished) {
+            cell.setCellState(task.getStatus());
+            cell.getBlockReasons().add("任务已" + cell.getStatusName() + "，不能改派");
+        } else if (started) {
+            cell.setCellState("RETEST".equals(task.getStatus()) ? "RETEST" : "CHECKING");
+            cell.getBlockReasons().add("任务已开始检测（当前第 " + task.getCurrentSeqNo() + " 工位"
+                    + (cell.getStationName().isBlank() ? "" : "·" + cell.getStationName())
+                    + "），不能改派");
+        } else {
+            cell.setCellState("WAITING");
+        }
+        // 防御性提示：正常派发事务保证不会出现，若数据被手工改动越界，格子如实标红
+        if (Boolean.FALSE.equals(cell.getOnDuty())) {
+            cell.getBlockReasons().add("引车员当前不在岗，请刷新后改派到其他引车员");
+        }
+        if (Boolean.FALSE.equals(cell.getInShift())) {
+            cell.getBlockReasons().add("该小时当前不在引车员排班时段内，请刷新后改派");
+        }
     }
 
     public List<Driver> listDrivers() {
@@ -235,17 +251,6 @@ public class ResourceService {
     }
 
     // ---------------- 工具 ----------------
-
-    private static LocalDate day(Task task) {
-        return task.getCheckDate();
-    }
-
-    private void checkHour(Integer hour) {
-        if (hour == null || hour < StationDict.SHIFT_START_HOUR || hour >= StationDict.SHIFT_END_HOUR) {
-            throw new BizException("排班小时段必须在 " + StationDict.SHIFT_START_HOUR + ":00 - "
-                    + StationDict.SHIFT_END_HOUR + ":00 之间");
-        }
-    }
 
     private static long remainDays(LocalDate nextCalDate, LocalDate today) {
         return ChronoUnit.DAYS.between(today, nextCalDate);
