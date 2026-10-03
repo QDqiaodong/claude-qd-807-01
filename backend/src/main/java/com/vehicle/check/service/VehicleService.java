@@ -77,11 +77,10 @@ public class VehicleService {
     }
 
     /**
-     * 可派单车辆：当日还没有检测任务的车辆
+     * 可派单车辆（待检队列）：当日还没有检测任务的车辆
      */
     public List<Vehicle> listAssignable(LocalDate date) {
-        Set<Long> busy = taskRepository.findAll().stream()
-                .filter(task -> date.equals(task.getCheckDate()))
+        Set<Long> busy = taskRepository.findByCheckDate(date).stream()
                 .map(Task::getVehicleId)
                 .collect(Collectors.toSet());
         List<Vehicle> result = new ArrayList<>();

@@ -50,6 +50,14 @@ export const fetchCalStat = () => unwrap(http.get('/devices/cal-stat'))
 
 export const fetchDrivers = () => unwrap(http.get('/drivers'))
 export const fetchSchedule = (date) => unwrap(http.get('/drivers/schedule', { params: { date } }))
+export const fetchDriverCandidates = (date, hour, excludeTaskId) =>
+  unwrap(http.get('/drivers/candidates', { params: { date, hour, excludeTaskId } }))
+export const assignTask = (driverId, payload) =>
+  unwrap(http.post(`/drivers/${driverId}/assign`, payload))
+export const reassignTask = (taskId, payload) =>
+  unwrap(http.post(`/drivers/tasks/${taskId}/reassign`, payload))
+export const fetchDriverStats = (date) =>
+  unwrap(http.get('/drivers/stats', { params: { date } }))
 
 // ---------------- 在检车辆跨线恢复处置台 ----------------
 export const fetchRecoveryBoard = () => unwrap(http.get('/recovery/board'))
@@ -58,11 +66,5 @@ export const confirmTransfer = (taskId, payload) =>
   unwrap(http.post(`/recovery/tasks/${taskId}/transfer`, payload))
 export const keepPending = (taskId, payload) =>
   unwrap(http.post(`/recovery/tasks/${taskId}/keep-pending`, payload))
-export const assignTask = (driverId, payload) =>
-  unwrap(http.post(`/drivers/${driverId}/assign`, payload))
-export const reassignTask = (taskId, driverId, hour) =>
-  unwrap(http.post(`/drivers/tasks/${taskId}/reassign`, null, { params: { driverId, hour } }))
-export const fetchDriverStats = (date) =>
-  unwrap(http.get('/drivers/stats', { params: { date } }))
 
 export default http

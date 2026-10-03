@@ -180,6 +180,17 @@ public class ReportService {
         task.setDriverId(request.getDriverId() == null ? origin.getDriverId() : request.getDriverId());
         task.setScheduleHour(request.getScheduleHour() == null ? origin.getScheduleHour() : request.getScheduleHour());
         task.setCheckDate(checkDate);
+        // 复检任务同样占用引车员小时格：与派发同一套「同日同小时唯一未结束任务」约束，
+        // 提前给出业务提示，避免撞 vc_task.uk_task_active_slot 唯一索引
+        if (task.getDriverId() != null && task.getScheduleHour() != null) {
+            List<Task> active = taskRepository.findActiveSlotTasks(
+                    task.getDriverId(), checkDate, task.getScheduleHour());
+            if (!active.isEmpty()) {
+                throw new BizException("引车员在 " + task.getScheduleHour() + ":00 时段已有未结束任务 "
+                        + active.get(0).getTaskNo() + "，同一引车员同日同小时只能有一个未结束任务，"
+                        + "请为复检另选引车员或时段");
+            }
+        }
         task.setRetestTimes(origin.getRetestTimes() + 1);
         // 复检链必须咬住原报告：转线只换检测线，不换任务/不换报告关联，
         // 全部剩余工位完成前不允许签发新报告（issueReport 的在检拦截天然保证）

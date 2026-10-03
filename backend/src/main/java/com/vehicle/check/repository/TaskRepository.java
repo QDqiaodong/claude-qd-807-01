@@ -29,6 +29,20 @@ public interface TaskRepository extends JpaRepository<Task, Long> {
 
     List<Task> findByVehicleIdAndCheckDate(Long vehicleId, LocalDate checkDate);
 
+    /** 某天的全部检测任务（排班格子表数据源） */
+    List<Task> findByCheckDate(LocalDate checkDate);
+
+    /**
+     * 某引车员某日某小时段的未结束任务（CHECKING/RETEST）。
+     * 正常返回 0 或 1 条；与 vc_task.uk_task_active_slot 唯一索引共同保证
+     * 「同一引车员同日同小时只能有一个未结束任务」。
+     */
+    @Query("select t from Task t where t.driverId = :driverId and t.checkDate = :checkDate "
+            + "and t.scheduleHour = :hour and t.status in ('CHECKING','RETEST')")
+    List<Task> findActiveSlotTasks(@Param("driverId") Long driverId,
+                                   @Param("checkDate") LocalDate checkDate,
+                                   @Param("hour") Integer hour);
+
     boolean existsByVehicleIdAndCheckDate(Long vehicleId, LocalDate checkDate);
 
     long countByStatusIn(List<String> statuses);

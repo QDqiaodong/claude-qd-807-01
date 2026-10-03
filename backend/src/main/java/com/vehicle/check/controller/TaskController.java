@@ -25,6 +25,8 @@ import com.vehicle.check.repository.VehicleRepository;
 import com.vehicle.check.service.ResourceService;
 import com.vehicle.check.service.TaskFlowService;
 
+import jakarta.validation.Valid;
+
 /**
  * 检测任务与工位流转
  */
@@ -64,9 +66,9 @@ public class TaskController {
         return ApiResponse.success(taskFlowService.getTask(id));
     }
 
-    /** 建立检测任务（送检派单） */
+    /** 建立检测任务（送检派单）：任务 + 小时格 + 车辆队列 + 检测线起点一次绑定 */
     @PostMapping
-    public ApiResponse<TaskVO> create(@RequestBody TaskCreateRequest request) {
+    public ApiResponse<TaskVO> create(@Valid @RequestBody TaskCreateRequest request) {
         return ApiResponse.success("任务已派发至流水线起点", taskFlowService.createTask(request));
     }
 

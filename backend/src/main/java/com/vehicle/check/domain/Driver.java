@@ -1,5 +1,7 @@
 package com.vehicle.check.domain;
 
+import java.time.LocalDate;
+
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
@@ -9,7 +11,7 @@ import jakarta.persistence.Table;
 import lombok.Data;
 
 /**
- * 引车员：姓名、资质、当日排班小时段、已检台次。
+ * 引车员：姓名、资质（含有效期）、当日排班小时段、已检台次。
  */
 @Data
 @Entity
@@ -28,6 +30,10 @@ public class Driver {
 
     @Column(name = "cert_no", nullable = false)
     private String certNo;
+
+    /** 资质有效期至：为空视为长期有效；早于任务日期即过期，不可派发/改派 */
+    @Column(name = "cert_expire_date")
+    private LocalDate certExpireDate;
 
     @Column(name = "shift_hours", nullable = false)
     private String shiftHours;

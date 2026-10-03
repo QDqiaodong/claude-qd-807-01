@@ -82,8 +82,18 @@ CREATE TABLE IF NOT EXISTS `vc_task` (
   `origin_report_no`   VARCHAR(32)   NULL COMMENT '复检任务关联的原报告编号（转线后仍保留，不能因换线洗掉）',
   `create_time`        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `finish_time`        DATETIME      NULL,
+  -- 排班小时格并发兜底键：仅「已派单且未结束（CHECKING/RETEST）」时生成 引车员-日期-小时 键，
+  -- 结束或未派单为 NULL（MySQL 唯一索引放行多个 NULL）。
+  -- 作用：同一引车员同日同小时最多一个未结束任务，并发派发/改派撞同一小时格时由数据库兜底，
+  --       与应用层行锁配合保证「新格只允许一次成功」，同一任务不可能占两格。
+  `active_slot_key`    VARCHAR(64)   GENERATED ALWAYS AS (
+    CASE WHEN `driver_id` IS NOT NULL AND `schedule_hour` IS NOT NULL AND `status` IN ('CHECKING','RETEST')
+         THEN CONCAT(`driver_id`, '-', `check_date`, '-', `schedule_hour`)
+         ELSE NULL END
+  ) STORED,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_task_no` (`task_no`),
+  UNIQUE KEY `uk_task_active_slot` (`active_slot_key`),
   KEY `idx_task_status` (`status`),
   KEY `idx_task_check_date` (`check_date`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -176,6 +186,7 @@ CREATE TABLE IF NOT EXISTS `vc_driver` (
   `driver_name`   VARCHAR(64) NOT NULL,
   `cert_level`    VARCHAR(16) NOT NULL COMMENT '资质 A1/A2/B2/C1',
   `cert_no`       VARCHAR(64) NOT NULL COMMENT '资格证编号',
+  `cert_expire_date` DATE     NULL COMMENT '资质有效期至（过期不可派发/改派）',
   `shift_hours`   VARCHAR(64) NOT NULL COMMENT '当日排班小时段，如 8,9,10,11',
   `checked_count` INT         NOT NULL DEFAULT 0 COMMENT '当日已检台次',
   `status`        VARCHAR(16) NOT NULL DEFAULT 'ON_DUTY' COMMENT 'ON_DUTY在岗/OFF_DUTY休息',
@@ -335,11 +346,12 @@ INSERT INTO `vc_device` (`id`,`device_name`,`model`,`device_type`,`last_cal_date
  (12,'三线灯光检测仪','NHD-8102','LIGHT','2026-01-12','2026-07-12','市计量所','PASS','OVERDUE'),
  (13,'三线底盘间隙仪','JX-770','CHASSIS','2026-02-02','2026-08-02','市计量所','PASS','OVERDUE');
 
--- 引车员（6 名）
-INSERT INTO `vc_driver` (`id`,`driver_name`,`cert_level`,`cert_no`,`shift_hours`,`checked_count`,`status`) VALUES
- (1,'张引车','A1','YCY-2019-0117','8,9,10,11,12',4,'ON_DUTY'),
- (2,'李引车','A2','YCY-2020-0342','10,11,12,13,14',3,'ON_DUTY'),
- (3,'王引车','A1','YCY-2018-0058','13,14,15,16,17',2,'ON_DUTY'),
- (4,'赵引车','B2','YCY-2021-0719','8,9,10,14,15',5,'ON_DUTY'),
- (5,'孙引车','A2','YCY-2017-0923','15,16,17',4,'ON_DUTY'),
- (6,'周引车','C1','YCY-2022-0456','8,9,10,11',0,'OFF_DUTY');
+-- 引车员（6 名；cert_expire_date 为资质有效期：李引车 2026-09-27 到期 → 其在 2026-09-28 的格子会显示资质过期冲突；
+-- 孙引车 2026-09-30 到期 → 今日（2026-10-03）派发被阻断；周引车过期且不在岗 → 双重阻断）
+INSERT INTO `vc_driver` (`id`,`driver_name`,`cert_level`,`cert_no`,`cert_expire_date`,`shift_hours`,`checked_count`,`status`) VALUES
+ (1,'张引车','A1','YCY-2019-0117','2027-12-31','8,9,10,11,12',4,'ON_DUTY'),
+ (2,'李引车','A2','YCY-2020-0342','2026-09-27','10,11,12,13,14',3,'ON_DUTY'),
+ (3,'王引车','A1','YCY-2018-0058','2026-12-31','13,14,15,16,17',2,'ON_DUTY'),
+ (4,'赵引车','B2','YCY-2021-0719','2027-01-31','8,9,10,14,15',5,'ON_DUTY'),
+ (5,'孙引车','A2','YCY-2017-0923','2026-09-30','15,16,17',4,'ON_DUTY'),
+ (6,'周引车','C1','YCY-2022-0456','2026-09-20','8,9,10,11',0,'OFF_DUTY');

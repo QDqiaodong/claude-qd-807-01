@@ -184,12 +184,24 @@
       </el-form-item>
       <el-form-item label="检测线">
         <el-select v-model="taskForm.lineId" style="width: 100%;">
-          <el-option v-for="l in lines" :key="l.id" :label="l.lineNo + ' · ' + l.lineName" :value="l.id" />
+          <el-option
+            v-for="l in lines"
+            :key="l.id"
+            :label="l.lineNo + ' · ' + l.lineName + (l.status !== 'RUNNING' ? '（停用）' : '')"
+            :value="l.id"
+            :disabled="l.status !== 'RUNNING'"
+          />
         </el-select>
       </el-form-item>
       <el-form-item label="引车员">
         <el-select v-model="taskForm.driverId" clearable style="width: 100%;">
-          <el-option v-for="d in drivers" :key="d.id" :label="d.driverName + '（' + d.certLevel + '）'" :value="d.id" />
+          <el-option
+            v-for="d in drivers"
+            :key="d.id"
+            :label="driverLabel(d)"
+            :value="d.id"
+            :disabled="driverUnavailable(d)"
+          />
         </el-select>
       </el-form-item>
       <el-form-item label="排班时段">
@@ -415,10 +427,27 @@ async function submitStation () {
 
 function openTaskDialog () {
   taskForm.vehicleId = vehicles.value[0]?.id ?? null
-  taskForm.lineId = lines.value[0]?.id ?? null
+  taskForm.lineId = (lines.value.find((l) => l.status === 'RUNNING') || lines.value[0])?.id ?? null
   taskForm.driverId = null
   taskForm.scheduleHour = 9
   taskVisible.value = true
+}
+
+function driverUnavailable (d) {
+  return d.status !== 'ON_DUTY' || (d.certExpireDate && d.certExpireDate < todayStr())
+}
+
+function driverLabel (d) {
+  const base = d.driverName + '（' + d.certLevel + '）'
+  if (d.status !== 'ON_DUTY') return base + ' — 不在岗'
+  if (d.certExpireDate && d.certExpireDate < todayStr()) return base + ' — 资质已于 ' + d.certExpireDate + ' 过期'
+  return base
+}
+
+function todayStr () {
+  const d = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
 }
 
 async function submitTask () {

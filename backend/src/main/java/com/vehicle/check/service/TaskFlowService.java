@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -88,6 +89,10 @@ public class TaskFlowService {
 
     /**
      * 建立检测任务（送检派单）。业务规则：同一车辆当天重复建档要拦截。
+     * <p>
+     * 派发把「任务 + 引车员小时格 + 车辆队列出队 + 检测线起点工位」绑定在同一事务：
+     * 任一规则不满足（非运行检测线 / 无工位 / 车辆当天已建档 / 引车员不在岗 / 资质过期 /
+     * 小时段不在班 / 小时格已被未结束任务占用 / 起点工位被占）整体回滚，不留半派发记录。
      */
     @Transactional
     public TaskVO createTask(TaskCreateRequest request) {
@@ -114,6 +119,42 @@ public class TaskFlowService {
         }
         Station first = stations.get(0);
 
+        // 引车员约束：指定引车员即占用其小时格，必须全套校验通过
+        if (request.getDriverId() != null) {
+            Driver driver = driverRepository.findById(request.getDriverId())
+                    .orElseThrow(() -> new BizException("引车员不存在：id=" + request.getDriverId()));
+            if (request.getScheduleHour() == null) {
+                throw new BizException("派发引车员时必须指定排班小时段（" + StationDict.SHIFT_START_HOUR
+                        + ":00-" + StationDict.SHIFT_END_HOUR + ":00）");
+            }
+            checkHour(request.getScheduleHour());
+            if (!"ON_DUTY".equals(driver.getStatus())) {
+                throw new BizException("引车员「" + driver.getDriverName() + "」当日不在岗，不能派发");
+            }
+            if (!ResourceService.certValid(driver, checkDate)) {
+                throw new BizException("引车员「" + driver.getDriverName() + "」资质已于 "
+                        + driver.getCertExpireDate() + " 过期，不能派发");
+            }
+            checkDriverShift(driver, request.getScheduleHour());
+            List<Task> active = taskRepository.findActiveSlotTasks(
+                    driver.getId(), checkDate, request.getScheduleHour());
+            if (!active.isEmpty()) {
+                Task occupying = active.get(0);
+                throw new BizException("引车员「" + driver.getDriverName() + "」在 " + request.getScheduleHour()
+                        + ":00 时段已有未结束任务 " + occupying.getTaskNo()
+                        + "，同一引车员同日同小时只能有一个未结束任务");
+            }
+        } else if (request.getScheduleHour() != null) {
+            checkHour(request.getScheduleHour());
+        }
+
+        // 检测线起点工位原子占位：仅 IDLE 可占成 OCCUPIED；占位失败（被并发车辆占用/故障）整体回滚
+        int claimed = stationRepository.claimStation(first.getId());
+        if (claimed == 0) {
+            throw new BizException("检测线「" + line.getLineNo() + "」起点工位「" + first.getStationName()
+                    + "」当前不可用（已被占用或故障），本次派发未生效，车辆仍在待检队列");
+        }
+
         Task task = new Task();
         task.setTaskNo(nextTaskNo(checkDate));
         task.setVehicleId(vehicle.getId());
@@ -127,20 +168,12 @@ public class TaskFlowService {
         task.setRetestTimes(0);
         task.setCreateTime(LocalDateTime.now());
 
-        if (request.getDriverId() != null) {
-            Driver driver = driverRepository.findById(request.getDriverId())
-                    .orElseThrow(() -> new BizException("引车员不存在：id=" + request.getDriverId()));
-            if (request.getScheduleHour() != null) {
-                checkDriverShift(driver, request.getScheduleHour());
-            }
+        try {
+            // saveAndFlush 立即落库：uk_task_active_slot / uk_task_no 唯一索引在并发派单时兜底
+            return toVO(taskRepository.saveAndFlush(task), vehicle.getPlateNo());
+        } catch (DataIntegrityViolationException e) {
+            throw new BizException("派发冲突：任务号或引车员小时格与并发请求冲突，本次派发未生效，请刷新后重试");
         }
-        if (request.getScheduleHour() != null) {
-            checkHour(request.getScheduleHour());
-        }
-
-        first.setStatus("OCCUPIED");
-        stationRepository.save(first);
-        return toVO(taskRepository.save(task), vehicle.getPlateNo());
     }
 
     /**
